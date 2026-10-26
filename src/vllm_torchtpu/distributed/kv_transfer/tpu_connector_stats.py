@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer import kv_cache_memory_stats
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     normalize_raiden_metric_name,
     parse_raiden_metric_key,
@@ -130,6 +131,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "num_failed_transfers": [],
             "num_evicted_blocks": [],
             "num_load_failed_tokens": [],
+            **{key: [] for key in kv_cache_memory_stats.STATS_KEYS},
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -355,6 +357,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues
         )
 
+        self.kv_cache_memory = kv_cache_memory_stats.KVCacheMemoryProm(
+            self._gauge_cls, self._counter_cls, labelnames, self.per_engine_labelvalues
+        )
+
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
             self._get_raiden_metric_definitions(labelnames)
         )
@@ -476,6 +482,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data.get(gauge_item_key, []):
                 cast(Gauge, gauge_obj[engine_idx]).set(list_item)
+
+        self.kv_cache_memory.observe(transfer_stats_data, engine_idx)
 
         # Dynamic metric observations
         base_labels = (

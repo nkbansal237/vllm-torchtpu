@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.request import Request
 
 import vllm_torchtpu.distributed.utils as dist_utils
@@ -87,6 +88,9 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     ReqId,
     SendMeta,
     TPUConnectorMetadata,
+)
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    KVCacheMemoryCollector,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
@@ -1001,25 +1005,33 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         gpu_block_pool.get_new_blocks = get_new_blocks  # type: ignore[method-assign]
         gpu_block_pool._maybe_evict_cached_block = _maybe_evict_cached_block  # type: ignore[method-assign]
 
-    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
-        """Drain the scheduler-side counts since the last step.
+    def bind_scheduler(self, scheduler: "Scheduler") -> None:
+        """Collect the HBM KV cache memory metrics of `scheduler`.
 
-        `bind_gpu_block_pool` counts evictions and `_count_load_failures`
-        failed loads; vLLM merges scheduler-side connector stats into the
-        step's stats.
+        Called by `_patch_vllm_scheduler_binds_kv_connector` once the
+        scheduler is constructed. See `kv_cache_memory_stats`.
         """
-        num_evicted_blocks = getattr(self, "_num_evicted_blocks", 0)
-        num_load_failed_tokens = getattr(self, "_num_load_failed_tokens", 0)
-        if not (num_evicted_blocks or num_load_failed_tokens):
-            return None
+        self._kv_cache_memory = KVCacheMemoryCollector(
+            scheduler, tpu_envs.TPU_KV_BLOCK_STATE_INTERVAL_S
+        )
+
+    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
+        """Drain the scheduler-side stats since the last step.
+
+        `bind_gpu_block_pool` counts evictions, `_count_load_failures` failed
+        loads, and the bound `KVCacheMemoryCollector` the rest; vLLM merges
+        scheduler-side connector stats into the step's stats.
+        """
         stats = TpuKVConnectorStats()
-        if num_evicted_blocks:
+        if num_evicted_blocks := getattr(self, "_num_evicted_blocks", 0):
             stats.record_evicted_blocks(num_evicted_blocks)
             self._num_evicted_blocks = 0
-        if num_load_failed_tokens:
+        if num_load_failed_tokens := getattr(self, "_num_load_failed_tokens", 0):
             stats.record_load_failed_tokens(num_load_failed_tokens)
             self._num_load_failed_tokens = 0
-        return stats
+        if (collector := getattr(self, "_kv_cache_memory", None)) is not None:
+            collector.record(stats)
+        return None if stats.is_empty() else stats
 
     def _finish_load_claim(self, request_id: str) -> None:
         # Dropped after the step's connector output is counted: a load that
